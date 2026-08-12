@@ -1,90 +1,498 @@
 #!/usr/bin/env bash
-# ------------------------------------------------------------
-# circuread CLI : deliver / review / fetch / route
-# Repo-level .circuread.yml 维护 upstreams / downstreams 列表。
-# Edge repo 始终由 upstream 创建并拥有。下游只是 collaborator。
-# ------------------------------------------------------------
-set -euo pipefail
+set -Eeuo pipefail
 shopt -s nullglob
 
-deps() {
-  command -v yq >/dev/null || { echo "❌ yq not found. brew/apt install yq" ; exit 1; }
-  command -v gh >/dev/null || { echo "❌ gh cli required"; exit 1; }
-}
-deps
+PROGRAM="circuread"
+VERSION="0.2.0"
+CONFIG_NAME=".circuread.yml"
+TMP_DIRS=()
+LAST_TMP=""
 
-CONFIG_FILE=".circuread.yml"
-ME=$(yq '.me' "$CONFIG_FILE")
-EX_ORG=$(yq '.exchange_org' "$CONFIG_FILE")
-
-uuid() { cat /proc/sys/kernel/random/uuid; }
-
-deliver() {
-  local note="$1"
-  local meta="${note%.tex}.meta.yml"
-  local uuid=$(uuid)
-  local push_to=($(yq '.push_to[]' "$meta" 2>/dev/null || true))
-
-  [[ ${#push_to[@]} -eq 0 ]] && { echo "No push_to reviewer set in $meta"; exit 1; }
-
-  for reviewer in "${push_to[@]}"; do
-     remote="git@github.com:${EX_ORG}/${reviewer}__to__${ME}.git"
-     tmp=$(mktemp -d)
-     mkdir -p "$tmp/$uuid"
-     cp "$note" "$meta" "$tmp/$uuid"/
-     ( cd "$tmp" && git init -q && git add .              && git commit -S -m "Deliver $note to $reviewer" )
-     pushd "$tmp" >/dev/null
-     if git ls-remote "$remote" &>/dev/null; then
-        git remote add origin "$remote"
-        git push -u origin master
-        echo "📤  Pushed to $remote"
-     else
-        echo "⚠️  Edge repo $remote not found. Ask upstream ($reviewer) to run sync-edges."
-     fi
-     popd >/dev/null
-     rm -rf "$tmp"
+cleanup() {
+  local dir
+  for dir in "${TMP_DIRS[@]:-}"; do
+    [[ -n "$dir" && -d "$dir" ]] && rm -rf -- "$dir"
   done
+  return 0
+}
+trap cleanup EXIT
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+ok() { printf 'ok: %s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+CircuRead 0.2.0
+
+Usage:
+  circuread doctor
+  circuread new <note-directory>
+  circuread deliver <note.tex>
+  circuread review <delivery-directory>
+  circuread fetch <delivery-uuid|--all>
+  circuread route <note.meta.yml> <add|remove> <github-user>
+  circuread sync
+  circuread version
+  circuread help
+
+Commands:
+  doctor   Check Git, GitHub authentication, yq, signing, and repository config.
+  new      Create note.tex and note.meta.yml without committing them.
+  deliver  Send one signed delivery to every reviewer in note.meta.yml.
+  review   Edit review.tex, then sign and push the review commit.
+  fetch    Import reviews under .circuread/reviews/ without overwriting the note.
+  route    Add or remove a reviewer safely; the metadata remains uncommitted.
+  sync     Ensure exchange repositories exist for configured upstreams.
+EOF
 }
 
-review() {
-  local edge_path="$1"
-  cd "$edge_path"
-  tex=$(ls */*.tex | head -n1)
-  ${EDITOR:-vim} "$tex"
-  git add "$tex"
-  git commit -S -m "Signed review"
-  git push
-  echo "🖋️  Review signed & pushed."
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required"
 }
 
-fetch() {
-  local uuid="$1"
-  for repo in $(gh repo list "$EX_ORG" --json name -q '.[].name' | grep "__${ME}$"); do
-     gh repo clone "$EX_ORG/$repo" "tmp_$repo" -- -q
-     if [[ -d tmp_$repo/$uuid ]]; then
-        cp -r tmp_$repo/$uuid/* .
-        git add .
-        git commit -S -m "Merge reviews from $repo"
-     fi
-     rm -rf "tmp_$repo"
-  done
-  git push
-  echo "⬇️  Reviews merged."
+validate_handle() {
+  [[ "$1" =~ ^[A-Za-z0-9-]+$ ]] || die "invalid GitHub owner or user: $1"
 }
 
-route() {
-  local meta="$1"
-  echo "Current push_to:"; yq '.push_to' "$meta"
-  read -p "Add reviewer (empty to skip): " rev
-  if [[ -n "$rev" ]]; then
-     yq -i '.push_to += ["'"$rev"'"]' "$meta"; git add "$meta"; git commit -m "Update routing"; git push
+make_tmp() {
+  LAST_TMP=$(mktemp -d)
+  TMP_DIRS+=("$LAST_TMP")
+}
+
+new_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    tr '[:upper:]' '[:lower:]' < /proc/sys/kernel/random/uuid
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import uuid; print(uuid.uuid4())'
+  else
+    die "uuidgen or python3 is required to create a delivery ID"
   fi
 }
 
-case "${1:-}" in
-  deliver) deliver "$2";;
-  review)  review  "$2";;
-  fetch)   fetch   "$2";;
-  route)   route   "$2";;
-  *) echo "Usage: circuread {deliver|review|fetch|route} <arg>";;
+load_config() {
+  need git
+  need yq
+
+  ROOT=$(git rev-parse --show-toplevel 2>/dev/null) ||
+    die "run this command inside a Git repository"
+  CONFIG_FILE="$ROOT/$CONFIG_NAME"
+  [[ -f "$CONFIG_FILE" ]] || die "missing $CONFIG_NAME at repository root"
+
+  ME=$(yq -r '.me // ""' "$CONFIG_FILE")
+  EX_ORG=$(yq -r '.exchange_org // ""' "$CONFIG_FILE")
+  [[ -n "$ME" ]] || die ".me is missing in $CONFIG_NAME"
+  [[ -n "$EX_ORG" ]] || die ".exchange_org is missing in $CONFIG_NAME"
+  validate_handle "$ME"
+  validate_handle "$EX_ORG"
+}
+
+require_github() {
+  need gh
+  gh auth status >/dev/null 2>&1 || die "GitHub CLI is not authenticated; run: gh auth login"
+}
+
+require_signing() {
+  local signing_key
+  signing_key=$(git config --get user.signingkey || true)
+  [[ -n "$signing_key" ]] ||
+    die "Git signing key is not configured; set user.signingkey before using CircuRead"
+  [[ -n "$(git config --get user.name || true)" ]] ||
+    die "Git user.name is not configured"
+  [[ -n "$(git config --get user.email || true)" ]] ||
+    die "Git user.email is not configured"
+}
+
+doctor() {
+  local failed=0
+  local command_name
+
+  for command_name in git gh yq; do
+    if command -v "$command_name" >/dev/null 2>&1; then
+      ok "$command_name found"
+    else
+      printf 'missing: %s\n' "$command_name" >&2
+      failed=1
+    fi
+  done
+
+  if command -v gh >/dev/null 2>&1; then
+    if gh auth status >/dev/null 2>&1; then
+      ok "GitHub CLI authenticated"
+    else
+      printf 'missing: GitHub CLI authentication\n' >&2
+      failed=1
+    fi
+  fi
+
+  if git config --get user.signingkey >/dev/null 2>&1; then
+    ok "Git signing key configured"
+  else
+    printf 'missing: git user.signingkey\n' >&2
+    failed=1
+  fi
+
+  if command -v yq >/dev/null 2>&1; then
+    if ROOT=$(git rev-parse --show-toplevel 2>/dev/null) &&
+       [[ -f "$ROOT/$CONFIG_NAME" ]]; then
+      CONFIG_FILE="$ROOT/$CONFIG_NAME"
+      ME=$(yq -r '.me // ""' "$CONFIG_FILE")
+      EX_ORG=$(yq -r '.exchange_org // ""' "$CONFIG_FILE")
+      if [[ -n "$ME" && -n "$EX_ORG" ]]; then
+        ok "$CONFIG_NAME parsed ($ME via $EX_ORG)"
+      else
+        printf 'invalid: %s must define me and exchange_org\n' "$CONFIG_NAME" >&2
+        failed=1
+      fi
+    fi
+  else
+    printf 'missing: %s in current repository\n' "$CONFIG_NAME" >&2
+    failed=1
+  fi
+
+  return "$failed"
+}
+
+new_note() {
+  [[ $# -eq 1 ]] || die "usage: circuread new <note-directory>"
+  load_config
+
+  local relative_dir="$1"
+  [[ "$relative_dir" != /* && "$relative_dir" != *".."* ]] ||
+    die "note directory must be a relative path without .."
+
+  local note_dir="$ROOT/$relative_dir"
+  [[ ! -e "$note_dir/note.tex" && ! -e "$note_dir/note.meta.yml" ]] ||
+    die "note files already exist in $relative_dir"
+
+  mkdir -p "$note_dir"
+  cat > "$note_dir/note.tex" <<'EOF'
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\title{Untitled Idea}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+Write the question, evidence, and next experiment here.
+
+\end{document}
+EOF
+  cat > "$note_dir/note.meta.yml" <<EOF
+title: Untitled Idea
+writer: $ME
+readers: []
+push_to: []
+EOF
+  ok "created $relative_dir/note.tex and $relative_dir/note.meta.yml"
+  info "Edit both files, then commit them when ready."
+}
+
+ensure_edge() {
+  local reviewer="$1"
+  validate_handle "$reviewer"
+  [[ "$reviewer" != "$ME" ]] || die "reviewer cannot be the same as the author"
+
+  EDGE_NAME="${ME}__to__${reviewer}"
+  EDGE_FULL="$EX_ORG/$EDGE_NAME"
+
+  if ! gh repo view "$EDGE_FULL" >/dev/null 2>&1; then
+    gh repo create "$EDGE_FULL" --private --disable-issues --disable-wiki >/dev/null
+    ok "created private exchange repository $EDGE_FULL"
+  fi
+
+  gh api -X PUT "repos/$EDGE_FULL/collaborators/$reviewer" \
+    -f permission=push >/dev/null
+}
+
+checkout_edge_main() {
+  local repo_dir="$1"
+  if git -C "$repo_dir" show-ref --verify --quiet refs/heads/main; then
+    git -C "$repo_dir" checkout -q main
+  elif git -C "$repo_dir" show-ref --verify --quiet refs/remotes/origin/main; then
+    git -C "$repo_dir" checkout -q -b main --track origin/main
+  elif [[ "$(git -C "$repo_dir" symbolic-ref --quiet --short HEAD || true)" == "main" ]]; then
+    :
+  else
+    git -C "$repo_dir" checkout -q --orphan main
+  fi
+}
+
+deliver() {
+  [[ $# -eq 1 ]] || die "usage: circuread deliver <note.tex>"
+  load_config
+  require_github
+  require_signing
+
+  local note="$1"
+  [[ "$note" = /* ]] || note="$PWD/$note"
+  [[ -f "$note" ]] || die "note not found: $1"
+  [[ "$note" == *.tex ]] || die "note must be a .tex file"
+  note="$(cd -- "$(dirname -- "$note")" && pwd -P)/$(basename -- "$note")"
+  [[ "$note" == "$ROOT/"* ]] ||
+    die "note must be inside the configured idea repository"
+
+  local meta="${note%.tex}.meta.yml"
+  [[ -f "$meta" ]] || die "metadata not found: $meta"
+
+  local reviewers=()
+  local reviewer
+  while IFS= read -r reviewer; do
+    [[ -n "$reviewer" ]] && reviewers+=("$reviewer")
+  done < <(yq -r '.push_to[]? // empty' "$meta")
+
+  [[ ${#reviewers[@]} -gt 0 ]] || die "no reviewers in $meta"
+  local delivery_id
+  delivery_id=$(new_uuid)
+  local created_at
+  created_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+  for reviewer in "${reviewers[@]}"; do
+    ensure_edge "$reviewer"
+    make_tmp
+    local clone_dir="$LAST_TMP/edge"
+
+    gh repo clone "$EDGE_FULL" "$clone_dir" -- --quiet
+    checkout_edge_main "$clone_dir"
+
+    local delivery_dir="$clone_dir/deliveries/$delivery_id"
+    [[ ! -e "$delivery_dir" ]] || die "delivery already exists: $delivery_id"
+    mkdir -p "$delivery_dir"
+    cp -- "$note" "$delivery_dir/note.tex"
+    cp -- "$meta" "$delivery_dir/note.meta.yml"
+
+    cat > "$delivery_dir/delivery.yml" <<EOF
+id: $delivery_id
+author: $ME
+reviewer: $reviewer
+created_at: $created_at
+EOF
+    cat > "$delivery_dir/review.tex" <<'EOF'
+\section*{Review}
+
+\textbf{Summary}
+
+Write a short summary of the idea.
+
+\textbf{Major comments}
+
+List the questions or changes that would most affect the argument or experiment.
+
+\textbf{Minor comments}
+
+Record smaller corrections here.
+EOF
+
+    git -C "$clone_dir" add "deliveries/$delivery_id"
+    git -C "$clone_dir" commit -S -m "Deliver $delivery_id to $reviewer"
+    git -C "$clone_dir" push -u origin HEAD:main
+    ok "delivered $delivery_id to $reviewer via $EDGE_FULL"
+  done
+
+  printf 'delivery_id=%s\n' "$delivery_id"
+}
+
+review() {
+  [[ $# -eq 1 ]] || die "usage: circuread review <delivery-directory>"
+  need git
+  require_signing
+
+  local delivery_dir="$1"
+  [[ -d "$delivery_dir" ]] || die "delivery directory not found: $delivery_dir"
+  local review_file="$delivery_dir/review.tex"
+  [[ -f "$review_file" ]] || die "review template not found: $review_file"
+
+  local edge_root
+  edge_root=$(git -C "$delivery_dir" rev-parse --show-toplevel 2>/dev/null) ||
+    die "delivery directory is not inside an exchange repository"
+
+  "${EDITOR:-vi}" "$review_file"
+  git -C "$edge_root" add "$review_file"
+
+  if git -C "$edge_root" diff --cached --quiet; then
+    info "No review changes to commit."
+    return 0
+  fi
+
+  local delivery_id
+  delivery_id=$(basename "$delivery_dir")
+  git -C "$edge_root" commit -S -m "Review $delivery_id"
+  git -C "$edge_root" push
+  ok "signed and pushed review $delivery_id"
+}
+
+review_is_ready() {
+  local clone_dir="$1"
+  local delivery_id="$2"
+  local review_path="deliveries/$delivery_id/review.tex"
+  local review_commit subject commit_object
+
+  review_commit=$(git -C "$clone_dir" log -1 --format=%H -- "$review_path" || true)
+  [[ -n "$review_commit" ]] || return 1
+  subject=$(git -C "$clone_dir" show -s --format=%s "$review_commit")
+  [[ "$subject" == "Review $delivery_id"* ]] || return 1
+  commit_object=$(git -C "$clone_dir" cat-file -p "$review_commit")
+  grep -q '^gpgsig ' <<<"$commit_object" || return 1
+
+  info "signed review commit detected for $delivery_id"
+}
+
+copy_delivery() {
+  local source_dir="$1"
+  local reviewer="$2"
+  local clone_dir="$3"
+  local delivery_id
+  delivery_id=$(basename "$source_dir")
+  if ! review_is_ready "$clone_dir" "$delivery_id"; then
+    printf 'skip: %s from %s has no signed review commit\n' \
+      "$delivery_id" "$reviewer" >&2
+    return 0
+  fi
+  local target_dir="$ROOT/.circuread/reviews/$delivery_id/$reviewer"
+
+  mkdir -p "$target_dir"
+  cp -R "$source_dir/." "$target_dir/"
+  FOUND=$((FOUND + 1))
+  ok "imported $delivery_id from $reviewer"
+}
+
+fetch_reviews() {
+  [[ $# -eq 1 ]] || die "usage: circuread fetch <delivery-uuid|--all>"
+  load_config
+  require_github
+  require_signing
+
+  local selector="$1"
+  if [[ "$selector" != "--all" ]]; then
+    [[ "$selector" =~ ^[0-9a-fA-F-]{36}$ ]] ||
+      die "delivery UUID is invalid: $selector"
+  fi
+
+  FOUND=0
+  local edge reviewer clone_dir delivery_dir
+  while IFS= read -r edge; do
+    [[ "$edge" == "$ME"__to__* ]] || continue
+    reviewer="${edge#"$ME"__to__}"
+    make_tmp
+    clone_dir="$LAST_TMP/edge"
+    gh repo clone "$EX_ORG/$edge" "$clone_dir" -- --quiet
+
+    if [[ "$selector" == "--all" ]]; then
+      for delivery_dir in "$clone_dir"/deliveries/*; do
+        [[ -d "$delivery_dir" ]] || continue
+        copy_delivery "$delivery_dir" "$reviewer" "$clone_dir"
+      done
+    else
+      delivery_dir="$clone_dir/deliveries/$selector"
+      [[ -d "$delivery_dir" ]] &&
+        copy_delivery "$delivery_dir" "$reviewer" "$clone_dir"
+    fi
+  done < <(gh repo list "$EX_ORG" --limit 1000 --json name -q '.[].name')
+
+  [[ $FOUND -gt 0 ]] || die "no matching deliveries found"
+
+  git -C "$ROOT" add ".circuread/reviews"
+  if git -C "$ROOT" diff --cached --quiet; then
+    info "Reviews are already up to date."
+    return 0
+  fi
+
+  git -C "$ROOT" commit -S -m "Import CircuRead reviews ($selector)"
+  ok "imported $FOUND review snapshot(s)"
+  info "The commit is local. Inspect it, then run git push."
+}
+
+route() {
+  [[ $# -eq 3 ]] || die "usage: circuread route <note.meta.yml> <add|remove> <github-user>"
+  need yq
+
+  local meta="$1"
+  local action="$2"
+  local reviewer="$3"
+  [[ -f "$meta" ]] || die "metadata not found: $meta"
+  validate_handle "$reviewer"
+
+  case "$action" in
+    add)
+      REVIEWER="$reviewer" yq -i \
+        '.push_to = (((.push_to // []) + [strenv(REVIEWER)]) | unique)' "$meta"
+      ;;
+    remove)
+      REVIEWER="$reviewer" yq -i \
+        '.push_to = ((.push_to // []) | map(select(. != strenv(REVIEWER))))' "$meta"
+      ;;
+    *)
+      die "route action must be add or remove"
+      ;;
+  esac
+
+  ok "updated $meta"
+  info "The metadata is not committed automatically."
+}
+
+sync_edges() {
+  [[ $# -eq 0 ]] || die "usage: circuread sync"
+  load_config
+  require_github
+
+  local reviewers=()
+  local reviewer
+  while IFS= read -r reviewer; do
+    [[ -n "$reviewer" ]] && reviewers+=("$reviewer")
+  done < <(yq -r '.upstreams[]? // empty' "$CONFIG_FILE")
+
+  [[ ${#reviewers[@]} -gt 0 ]] || {
+    info "No upstreams configured; deliver will still create edges on demand."
+    return 0
+  }
+
+  for reviewer in "${reviewers[@]}"; do
+    ensure_edge "$reviewer"
+    ok "edge ready: $EDGE_FULL"
+  done
+}
+
+case "${1:-help}" in
+  help|-h|--help)
+    usage
+    ;;
+  version|-V|--version)
+    printf '%s %s\n' "$PROGRAM" "$VERSION"
+    ;;
+  doctor)
+    shift
+    doctor "$@"
+    ;;
+  new)
+    shift
+    new_note "$@"
+    ;;
+  deliver)
+    shift
+    deliver "$@"
+    ;;
+  review)
+    shift
+    review "$@"
+    ;;
+  fetch)
+    shift
+    fetch_reviews "$@"
+    ;;
+  route)
+    shift
+    route "$@"
+    ;;
+  sync)
+    shift
+    sync_edges "$@"
+    ;;
+  *)
+    usage >&2
+    die "unknown command: $1"
+    ;;
 esac
