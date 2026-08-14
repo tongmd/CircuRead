@@ -1,24 +1,9 @@
 #!/usr/bin/env bash
-# ------------------------------------------------------------
-# fetch_edges.sh : merge every edge repo's new commits
-# ------------------------------------------------------------
-set -euo pipefail
-command -v yq >/dev/null
-command -v gh >/dev/null
+set -Eeuo pipefail
 
-CFG=.circuread.yml
-ME=$(yq '.me' "$CFG")
-EX_ORG=$(yq '.exchange_org' "$CFG")
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CLI="${CIRCUREAD_BIN:-$SCRIPT_DIR/circuread}"
 
-uuid=$(date +%s)
+echo "fetch_edges.sh is deprecated; forwarding to: circuread fetch --all" >&2
+exec "$CLI" fetch --all
 
-for edge in $(gh repo list "$EX_ORG" --json name -q '.[].name' \
-              | grep -E "__${ME}$|^${ME}__"); do
-  gh repo clone "$EX_ORG/$edge" "tmp_$edge" -- -q
-  cp -r tmp_$edge/* .
-  rm -rf tmp_$edge
-done
-
-git add .
-git diff --cached --quiet || git commit -S -m "Auto-fetch edge repos $uuid"
-git push

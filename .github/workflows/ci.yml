@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run behavior tests
+        run: |
+          bash tests/test_cli.sh
+          bash tests/test_exchange.sh
+
+      - name: Run ShellCheck
+        run: shellcheck circuread bootstrap.sh fetch_edges.sh manage_edges.sh tests/test_cli.sh tests/test_exchange.sh

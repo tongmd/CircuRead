@@ -1,151 +1,169 @@
-# CircuRead: A Distributed Academic Idea-Review System
+# CircuRead
 
-CircuRead transforms Git and GitHub into a **distributed, digitally-signed, multi-tier peer-review system**, designed to facilitate the secure, efficient, and transparent exchange of academic ideas, enabling rapid identification and promotion of high-quality research concepts.
+CircuRead is a small command-line protocol for exchanging early research notes through private GitHub repositories. A delivery contains the note, its routing metadata, a review template, and signed Git history.
 
-[**English**](README.md) | [**中文**](README_CN.md)
+[English](README.md) | [中文](README_CN.md)
 
----
+> Status: experimental. Use it for trusted research groups, inspect every imported review, and keep the idea repository private.
 
-## Vision
+## What works
 
-CircuRead aims to establish a decentralized and transparent academic review mechanism that accelerates the discovery and elevation of high-quality academic ideas, fostering an open, trusted academic environment, and channeling research resources towards the most impactful and promising projects.
+- `circuread new` scaffolds a LaTeX note and metadata.
+- `circuread deliver` creates or reuses one private exchange repository per author and reviewer.
+- Every delivery receives a stable UUID and lives under `deliveries/<uuid>/`.
+- `circuread review` edits a separate `review.tex` and requires a signed commit.
+- `circuread fetch` imports reviews under `.circuread/reviews/` without overwriting the source note.
+- `circuread route` updates reviewer metadata without interpolating user input into a `yq` expression.
+- `circuread doctor` checks dependencies, GitHub authentication, signing, and configuration.
 
----
+Git signatures make later changes detectable; they do not make a GitHub repository literally immutable.
 
-## Key Features
+## Requirements
 
-* **Decentralized Storage**: Every researcher maintains their own GitHub repository for storing idea notes, ensuring data resilience and eliminating single points of failure.
-* **Robust Version Control**: Leveraging Git’s comprehensive version tracking to record every edit, addition, and signature, providing complete and traceable historical records.
-* **Immutable Signatures**: Utilizes GPG-signed Git commits to verify the authenticity of reviews and maintain the integrity of idea content.
-* **LaTeX Integration**: Supports professional-quality and consistently formatted idea notes written in LaTeX.
-* **Automated Review Workflow**: GitHub Actions automates review request checks and notifications, minimizing manual overhead.
-* **Flexible Multi-Tier Review Hierarchy**: Researchers can review ideas from their downstream colleagues while their own ideas are reviewed upstream, enabling dynamic collaboration.
+- Bash 4 or newer
+- Git
+- [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login`
+- [mikefarah/yq](https://github.com/mikefarah/yq) version 4
+- A configured Git signing key. GPG and SSH signing are both supported by Git.
 
----
-
-## How It Works
-
-1. **Individual Repositories**: Each researcher maintains a private repository, e.g., `alice/ideas`.
-
-2. **Idea Notes & Metadata**: Ideas are stored in directories with associated metadata:
-
-   ```
-   qubits/
-     ├── note.tex
-     └── note.meta.yml
-   ```
-
-   The metadata file defines routing and access control.
-
-3. **Upstream Submission**: Using `circuread deliver qubits/note.tex`, the system automatically reads the `push_to` list, sets up exchange repositories for each `(originator → reviewer)` pair, grants access, and pushes signed commits.
-
-4. **Review & Signature**: Reviewers run `circuread review`, append a `\signature{…}` in LaTeX, commit with GPG signature, and push back.
-
-5. **Fetch & Merge**: Authors execute `circuread fetch <uuid>` to integrate reviews; downstream readers automatically receive read-only updates.
-
-6. **Parallel Multi-Upstream**: Ideas can simultaneously reach multiple reviewers without merge conflicts, as each reviewer maintains their separate history.
-
-7. **Dynamic Permissions Management**: Access permissions are automatically synchronized whenever the configuration is updated, ensuring current and effective collaboration relationships.
-
----
-
-## Getting Started
-
-### Prerequisites
-
-* GitHub account and Git CLI
-* GitHub CLI (`gh`)
-* GPG key for signed commits ([Guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/generating-a-new-gpg-key))
-
-### Repository Setup
-
-```yaml
-# .circuread.yml
-me: alice_smith
-upstreams: [bob_johnson, clara_kim]
-downstreams: [charlie_lee, dana_chen]
-exchange_org: circuread-xrepos
-default_visibility: private
-```
-
-Creating the first note:
+Check the environment:
 
 ```bash
-mkdir -p qubits
-touch qubits/note.tex qubits/note.meta.yml
+circuread doctor
 ```
 
-Example `note.meta.yml`:
+## Install
+
+```bash
+git clone https://github.com/tongmd/CircuRead.git
+cd CircuRead
+install -m 0755 circuread "$HOME/.local/bin/circuread"
+```
+
+Make sure `$HOME/.local/bin` is on `PATH`. To create a new private idea repository and install the CLI in one step:
+
+```bash
+./bootstrap.sh YOUR_GITHUB_USER ideas YOUR_EXCHANGE_ORG
+```
+
+The exchange organization must allow you to create private repositories and invite collaborators.
+
+## Configure an existing idea repository
+
+Create `.circuread.yml` at the repository root:
+
+```yaml
+me: alice
+exchange_org: research-exchange
+upstreams:
+  - bob
+```
+
+Create a note:
+
+```bash
+circuread new notes/topological-qubits
+```
+
+Edit `notes/topological-qubits/note.tex` and its metadata:
 
 ```yaml
 title: Topological Qubits
-writer: alice_smith
-noters: []
-readers: [charlie_lee, dana_chen]
-push_to: [bob_johnson, clara_kim]
+writer: alice
+readers: []
+push_to:
+  - bob
+  - clara
 ```
 
-Enable commit signing:
+Commit the note in the private idea repository, then deliver it:
 
 ```bash
-git config --global user.signingkey YOUR_GPG_ID
-git config --global commit.gpgsign true
+git add notes/topological-qubits
+git commit -S -m "Draft topological-qubits"
+circuread deliver notes/topological-qubits/note.tex
 ```
 
-### Daily Workflow
+The command prints a value such as:
+
+```text
+delivery_id=7da3b87d-5e14-4be0-b882-04bc92f26ad7
+```
+
+Each exchange repository is named `<author>__to__<reviewer>`. CircuRead reuses its `main` branch, so repeated deliveries preserve history instead of creating unrelated repositories.
+
+## Review
+
+The reviewer accepts the GitHub invitation, clones the exchange repository, and runs:
 
 ```bash
-# Originator writes note
-vim qubits/note.tex
-git add qubits/*
-git commit -S -m "Draft: topological qubits"
-circuread deliver qubits/note.tex
-
-# Reviewer evaluates note
-circuread review ~/gh/circuread-xrepos/alice__to__bob/qubits/<uuid>
-
-# Originator fetches reviews
-circuread fetch <uuid>
+circuread review deliveries/7da3b87d-5e14-4be0-b882-04bc92f26ad7
 ```
 
----
+CircuRead opens `review.tex` in `EDITOR`, creates a signed commit, and pushes it.
 
-## Signature Verification
+## Fetch
+
+From the author's private idea repository:
+
+```bash
+circuread fetch 7da3b87d-5e14-4be0-b882-04bc92f26ad7
+# or import every accessible delivery
+circuread fetch --all
+```
+
+Imported snapshots are stored at:
+
+```text
+.circuread/reviews/<delivery-uuid>/<reviewer>/
+```
+
+CircuRead creates a signed local commit but does not push it automatically. Inspect the diff and run `git push` yourself.
+
+## Commands
+
+| Command | Effect |
+| --- | --- |
+| `doctor` | Validate the local environment and repository |
+| `new <dir>` | Scaffold a note without committing it |
+| `deliver <note.tex>` | Create a UUID and send signed copies to reviewers |
+| `review <delivery-dir>` | Edit, sign, and push `review.tex` |
+| `fetch <uuid\|--all>` | Import review snapshots without replacing the note |
+| `route <meta> add\|remove <user>` | Safely edit `push_to` |
+| `sync` | Prepare exchange repositories listed in `upstreams` |
+
+The legacy `fetch_edges.sh` and `manage_edges.sh` files are compatibility wrappers around `fetch --all` and `sync`.
+
+## Delivery layout
+
+```text
+author__to__reviewer/
+└── deliveries/
+    └── <uuid>/
+        ├── delivery.yml
+        ├── note.meta.yml
+        ├── note.tex
+        └── review.tex
+```
+
+## Verify signatures
 
 ```bash
 git log --show-signature --decorate --oneline
 ```
 
----
+Reviewers should verify the author fingerprint out of band before trusting a signature. Repository administrators can rewrite Git history, so keep independent clones or protected branches when auditability matters.
 
-## Contributing
+## Development
 
-Bug reports, feature requests, or workflow enhancements are welcome via Issues or Pull Requests.
-
----
-
-## File Structure
-
-```text
-startup/
-├── bootstrap.sh
-├── circuread
-├── fetch_edges.sh
-├── manage_edges.sh
-└── .github/
-    └── workflows/
-        ├── auto_fetch.yml
-        └── sync_edges.yml
-
-my-ideas/                       # Example private repository
-├── .circuread.yml
-└── qubits/
-    ├── note.tex
-    └── note.meta.yml
+```bash
+bash tests/test_cli.sh
+bash tests/test_exchange.sh
+shellcheck circuread bootstrap.sh fetch_edges.sh manage_edges.sh tests/*.sh
 ```
 
----
+Continuous integration runs the same syntax, behavior, and ShellCheck checks.
 
 ## License
 
-MIT © 2025 CircuRead Contributors
+MIT © 2025–2026 CircuRead contributors
